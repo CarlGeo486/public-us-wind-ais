@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIS - active vessels</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: #0b1416;
+      font-family: monospace
+    }
+
+    #map {
+      position: absolute;
+      inset: 0
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 1000;
+      background: rgba(8, 18, 22, .85);
+      color: #cfeee2;
+      padding: 10px 14px;
+      border: 1px solid #2c4a42;
+      border-radius: 6px;
+      font-size: 13px
+    }
+
+    #hud b {
+      color: #37e8a0
+    }
+
+    .leaflet-tooltip.ves-label {
+      background: transparent;
+      border: none;
+      box-shadow: none;
+      padding: 0;
+      margin: 0;
+      color: #9fdfc8;
+      font-family: monospace;
+      font-size: 12px;
+      white-space: nowrap;
+      text-shadow: 0 0 3px #000, 0 0 3px #000;
+    }
+
+    .leaflet-tooltip.ves-label::before {
+      display: none;
+    }
+
+    .leaflet-popup-content {
+      font-family: monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .leaflet-popup-content b {
+      color: #0b6b4f;
+    }
+
+    .leaflet-tooltip.wtg-label {
+      color: #ff9f43;
+    }
+
+    #disclaimer-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(5, 10, 12, 0.93);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #disclaimer-box {
+      background: #081216;
+      border: 1px solid #ff5252;
+      padding: 24px;
+      max-width: 440px;
+      border-radius: 8px;
+      text-align: center;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+    }
+
+    #disclaimer-box p {
+      color: #cfeee2;
+      font-size: 13px;
+      line-height: 1.6;
+      margin: 0 0 20px 0;
+    }
+
+    #ack-btn {
+      background: #37e8a0;
+      color: #0b1416;
+      border: none;
+      padding: 10px 20px;
+      font-family: monospace;
+      font-size: 13px;
+      font-weight: bold;
+      cursor: pointer;
+      border-radius: 4px;
+      width: 100%;
+    }
+
+    #ack-btn:hover {
+      background: #29c788;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="disclaimer-overlay">
+    <div id="disclaimer-box">
+      <p>This is a hobby project that was put together over a few free nights. This sources a variety of AIS open data
+        projects from unknown authors and should not be relied on by anyone for any purpose anywhere.</p>
+      <button id="ack-btn" onclick="acknowledgeDisclaimer()">I Acknowledge</button>
+    </div>
+  </div>
+  <div id="map"></div>
+  <div id="hud"><b id="count">0</b> vessels &middot; <span id="status">loading...</span></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="sunrise-wtg-locations.js"></script>
+  <script>
+    // ===== CONFIG — every tunable lives here =====================================
+    // Data source: flip USE_BUCKET to choose where vessel data comes from.
+    //   false -> the local server (for dev, or an SSH tunnel to the VM)
+    //   true  -> the public GCS bucket the VM publishes to (for GitHub Pages)
+    var USE_BUCKET = true;
+    var LOCAL_URL  = "http://localhost:8080/vessels";
+    var BUCKET_URL = "https://storage.googleapis.com/wind-public-data-e37f6aaf3ba4/vessels.json";
+    var DATA_URL   = USE_BUCKET ? BUCKET_URL : LOCAL_URL;
+
+    var REFRESH_MS = 10000;                     // poll every 10 seconds
+    var TARGETS = [367194000, 368245692];       // highlighted MMSIs — keep in sync with WATCHED in server.js
+    var STALE_MS = 3600000;                     // strike through names older than 1 hour
+
+    // AOI — keep in sync with BBOX in server.js. Leaflet bounds = [[S,W],[N,E]].
+    var AOI = [[40.5, -73.0], [42.0, -70.0]];
+
+    // ===== MAP + STATIC LAYERS ===================================================
+    var map = L.map('map');
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+      { attribution: 'OpenStreetMap, CARTO', maxZoom: 19 }).addTo(map);
+
+    // faint AOI outline, below the markers
+    L.rectangle(AOI, { color: '#37e8a0', weight: 1, opacity: 0.25, fill: false, dashArray: '4 6', interactive: false }).addTo(map);
+    map.setView([41.0, -71.1], 11); // [Latitude, Longitude], Zoom Level
+
+    // Render the inlined wind farm layout dataset directly
+    L.geoJSON(SUNRISE_GEOJSON, {
+      pointToLayer: function (feature, latlng) {
+        var isStation = feature.properties.type !== 'WTG';
+        var clr = isStation ? '#ff5252' : '#ff9f43';
+
+        // Every asset is a stationary structure—give it a 150m ring
+        L.circle(latlng, { radius: 150, color: clr, weight: 0.8, dashArray: '4 4', fillOpacity: 0.03, interactive: false }).addTo(map);
+
+        return L.circleMarker(latlng, {
+          radius: isStation ? 6 : 3,
+          color: clr,
+          weight: 1,
+          fillColor: clr,
+          fillOpacity: 0.7
+        });
+      },
+      onEachFeature: function (feature, layer) {
+        layer.bindPopup('<b>Layout ID: ' + feature.properties.name + '</b><br>Type: ' + feature.properties.type);
+        layer.bindTooltip(feature.properties.name, { permanent: true, direction: 'top', offset: [0, -3], className: 'ves-label wtg-label' });
+      }
+    }).addTo(map);
+
+    // ===== DISCLAIMER ============================================================
+    function acknowledgeDisclaimer() {
+      document.getElementById('disclaimer-overlay').style.display = 'none';
+    }
+
+    // ===== SMALL HELPERS =========================================================
+    // escape vessel-supplied text before it goes into HTML
+    function esc(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // "12s ago" / "4m 10s ago" / "1h 3m ago"
+    function ago(ms) {
+      if (ms == null) return '—';
+      var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+      if (s < 60) return s + 's ago';
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + 'm ' + (s % 60) + 's ago';
+      var h = Math.floor(m / 60);
+      return h + 'h ' + (m % 60) + 'm ago';
+    }
+
+    // ===== VESSEL RENDERING ======================================================
+    // Records arrive from /vessels with a numeric report time `t` (already
+    // normalized by the server) and an `ais_source` of "aisstream" or "vesselapi".
+    // Fallback (vesselapi) fixes are drawn blue and dashed so a paid, possibly
+    // stale position is never mistaken for a live track.
+
+    function popupHtml(d) {
+      var sourceLine = (d.ais_source && d.ais_source !== 'aisstream')
+        ? 'Source: ' + esc(d.ais_source) + '<br>'
+        : '';
+      return '<b>' + esc(d.name || 'UNKNOWN') + '</b><br>'
+        + 'MMSI: ' + d.mmsi + '<br>'
+        + 'Speed: ' + (d.sog != null ? d.sog + ' kn' : '—') + '<br>'
+        + 'Course: ' + (d.cog != null ? Math.round(d.cog) + '\u00B0' : '—') + '<br>'
+        + sourceLine
+        + 'Last report: ' + ago(d.t);
+    }
+
+    var markers = {};   // mmsi -> Leaflet circleMarker
+
+    function refresh() {
+      fetch(DATA_URL)
+        .then(function (r) { return r.json(); })
+        .then(function (list) {
+          var seen = {};
+          list.forEach(function (vessel) {
+            // skip records without coordinates
+            if (vessel.lat == null || vessel.lon == null) return;
+
+            seen[vessel.mmsi] = true;
+
+            // styling: fallback fixes are blue + dashed, targets red, everyone else green
+            var isTarget = TARGETS.indexOf(vessel.mmsi) !== -1;
+            var isFallback = vessel.ais_source && vessel.ais_source !== 'aisstream';
+            var clr = isFallback ? '#8ab4f8' : (isTarget ? '#ff5252' : '#37e8a0');
+            var dash = isFallback ? '4 4' : null;
+
+            // strike through the label when the report time is over an hour old
+            var nm = vessel.name || String(vessel.mmsi);
+            var strike = (Date.now() - vessel.t) > STALE_MS ? 'text-decoration:line-through;' : '';
+            var labelColor = (isTarget || isFallback) ? 'color:' + clr + ';' : '';
+            var displayName = '<span style="' + strike + labelColor + '">' + esc(nm) + '</span>';
+
+            if (markers[vessel.mmsi]) {
+              markers[vessel.mmsi].setLatLng([vessel.lat, vessel.lon])
+                .setPopupContent(popupHtml(vessel))
+                .setTooltipContent(displayName)
+                .setStyle({ color: clr, fillColor: clr, dashArray: dash });
+            } else {
+              markers[vessel.mmsi] = L.circleMarker([vessel.lat, vessel.lon],
+                { radius: isTarget ? 6 : 4, color: clr, weight: 1, fillColor: clr, fillOpacity: .7, dashArray: dash })
+                .addTo(map)
+                .bindPopup(popupHtml(vessel))
+                .bindTooltip(displayName, { permanent: true, direction: 'top', offset: [0, -4], className: 'ves-label' });
+            }
+          });
+
+          // remove markers for vessels that aged out of the server's window
+          Object.keys(markers).forEach(function (mmsi) {
+            if (!seen[mmsi]) { map.removeLayer(markers[mmsi]); delete markers[mmsi]; }
+          });
+
+          document.getElementById('count').textContent = list.length;
+          document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+        })
+        .catch(function () { document.getElementById('status').textContent = 'server unreachable'; });
+    }
+
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+
+    // ===== TWO-CLICK STRETCH MEASURE (DBL-CLICK TRIGGER) =========================
+    var ringCenter = null;
+    var activeRing = null;
+    var ringTooltip = null;
+    var centerDot = null;
+
+    // 1. Disable default double-click zoom so the map stays perfectly still
+    map.doubleClickZoom.disable();
+
+    // 2. DOUBLE-CLICK: Anchors the center point and starts the engine
+    map.on('dblclick', function (e) {
+      if (ringCenter) return; // Safety shield if already drawing
+
+      ringCenter = e.latlng;
+
+      centerDot = L.circleMarker(ringCenter, {
+        radius: 3, color: '#00d2ff', fillColor: '#00d2ff', fillOpacity: 1, interactive: false
+      }).addTo(map);
+
+      activeRing = L.circle(ringCenter, {
+        radius: 0, color: '#00d2ff', weight: 1.5, dashArray: '6 6', fillOpacity: 0.05, interactive: false
+      }).addTo(map);
+
+      ringTooltip = L.tooltip({
+        permanent: true, direction: 'right', offset: [15, 0], className: 'ves-label'
+      }).setLatLng(ringCenter).setContent('00:00 at 10 kts<br>0.00 NM').addTo(map);
+
+      map.on('mousemove', stretchRing);
+
+      // Arm the single-click lock listener after a split second so the current interaction doesn't trip it
+      setTimeout(function () {
+        map.on('click', lockRing);
+      }, 50);
+    });
+
+    // 3. SINGLE-CLICK: Freezes the layout to solid green
+    function lockRing(e) {
+      map.off('mousemove', stretchRing);
+      map.off('click', lockRing); // Self-destructs this listener until the next run
+
+      activeRing.setStyle({ dashArray: null, color: '#37e8a0' });
+      centerDot.setStyle({ color: '#37e8a0', fillColor: '#37e8a0' });
+
+      // Reset state variables for the next measurement run
+      ringCenter = null; activeRing = null; ringTooltip = null; centerDot = null;
+    }
+
+    // 4. MOUSE MOVE: Handles real-time telemetry calculations
+    function stretchRing(e) {
+      if (!ringCenter) return;
+
+      var meters = ringCenter.distanceTo(e.latlng);
+      activeRing.setRadius(meters);
+
+      var nm = meters / 1852;
+
+      var totalHours = nm / 10;
+      var hrs = Math.floor(totalHours);
+      var mins = Math.round((totalHours - hrs) * 60);
+
+      if (mins === 60) { hrs++; mins = 0; }
+
+      var hh = hrs.toString().padStart(2, '0');
+      var mm = mins.toString().padStart(2, '0');
+
+      var labelHtml = '<span style="color:#8ab4f8; font-size:13px;">⏱ ' + hh + ':' + mm + ' at 10 kts</span><br>'
+        + '<b style="font-size:13px;">' + nm.toFixed(2) + ' NM</b>';
+
+      ringTooltip.setLatLng(e.latlng).setContent(labelHtml);
+
+    }
+
+  </script>
+</body>
+
+</html>
