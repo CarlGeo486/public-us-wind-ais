@@ -46,6 +46,7 @@
       color: #9fdfc8;
       font-family: monospace;
       font-size: 12px;
+      line-height: 1.05;
       white-space: nowrap;
       text-shadow: 0 0 3px #000, 0 0 3px #000;
     }
@@ -112,6 +113,60 @@
     #ack-btn:hover {
       background: #29c788;
     }
+
+    /* ===== project layers control (PIN-gated DB layers) ===== */
+    #proj {
+      position: absolute;
+      top: 58px;
+      right: 12px;
+      z-index: 1000;
+      background: rgba(8, 18, 22, .85);
+      color: #cfeee2;
+      padding: 10px 12px;
+      border: 1px solid #2c4a42;
+      border-radius: 6px;
+      font-size: 12px;
+      max-width: 230px;
+    }
+
+    #proj button {
+      background: #1d3b34;
+      color: #cfeee2;
+      border: 1px solid #2c4a42;
+      padding: 6px 10px;
+      font-family: monospace;
+      font-size: 12px;
+      cursor: pointer;
+      border-radius: 4px;
+      width: 100%;
+    }
+
+    #proj button:hover {
+      background: #234a41;
+    }
+
+    #proj input {
+      width: 100%;
+      box-sizing: border-box;
+      background: #050d10;
+      color: #cfeee2;
+      border: 1px solid #2c4a42;
+      padding: 6px 8px;
+      font-family: monospace;
+      font-size: 12px;
+      border-radius: 4px;
+      margin-bottom: 6px;
+    }
+
+    #proj-msg {
+      margin-top: 6px;
+      color: #9fdfc8;
+      min-height: 1em;
+    }
+
+    #proj-msg.err {
+      color: #ff7a7a;
+    }
   </style>
 </head>
 
@@ -125,6 +180,18 @@
   </div>
   <div id="map"></div>
   <div id="hud"><b id="count">0</b> vessels &middot; <span id="status">loading...</span></div>
+
+  <div id="right-panel">
+    <div id="proj">
+      <button id="proj-toggle" onclick="showProjPrompt()">Load project layers</button>
+      <div id="proj-form" style="display:none;">
+        <input id="proj-pw" type="password" placeholder="project password" autocomplete="off"
+          onkeydown="if(event.key==='Enter')loadProjectLayers()">
+        <button onclick="loadProjectLayers()">Show towers &amp; cables</button>
+      </div>
+      <div id="proj-msg"></div>
+    </div>
+  </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="sunrise-wtg-locations.js"></script>
@@ -154,14 +221,17 @@
     L.rectangle(AOI, { color: '#37e8a0', weight: 1, opacity: 0.25, fill: false, dashArray: '4 6', interactive: false }).addTo(map);
     map.setView([41.0, -71.1], 11); // [Latitude, Longitude], Zoom Level
 
-    // Render the inlined wind farm layout dataset directly
+    // Render the inlined wind farm layout dataset directly. Grouped so it can be
+    // swapped out for the project layers once those load.
+    var publicWtgLayer = L.layerGroup().addTo(map);
+
     L.geoJSON(SUNRISE_GEOJSON, {
       pointToLayer: function (feature, latlng) {
         var isStation = feature.properties.type !== 'WTG';
         var clr = isStation ? '#ff5252' : '#ff9f43';
 
         // Every asset is a stationary structure—give it a 150m ring
-        L.circle(latlng, { radius: 150, color: clr, weight: 0.8, dashArray: '4 4', fillOpacity: 0.03, interactive: false }).addTo(map);
+        L.circle(latlng, { radius: 150, color: clr, weight: 0.8, dashArray: '4 4', fillOpacity: 0.03, interactive: false }).addTo(publicWtgLayer);
 
         return L.circleMarker(latlng, {
           radius: isStation ? 6 : 3,
@@ -175,7 +245,7 @@
         layer.bindPopup('<b>Layout ID: ' + feature.properties.name + '</b><br>Type: ' + feature.properties.type);
         layer.bindTooltip(feature.properties.name, { permanent: true, direction: 'top', offset: [0, -3], className: 'ves-label wtg-label' });
       }
-    }).addTo(map);
+    }).addTo(publicWtgLayer);
 
     // ===== DISCLAIMER ============================================================
     function acknowledgeDisclaimer() {
@@ -269,6 +339,137 @@
 
     refresh();
     setInterval(refresh, REFRESH_MS);
+
+    // ===== PROJECT LAYERS (PIN-gated, loaded from Neon Postgres) ==================
+    // Tower designations and cable routes that aren't in the public filings live
+    // in a read-only Neon DB (role: neondb_viewer, SELECT-only, this table set
+    // only). The password is TYPED AT RUNTIME and never committed — only the
+    // host/role template below ships to the repo. Honest limitation: once someone
+    // loads these layers, the completed connection string is visible in their
+    // browser devtools, so treat the password as "shared with everyone you give
+    // it to," use a random ~12-char value, and rotate it to revoke access.
+    //
+    // >>> EDIT host/db here if yours differ (role stays neondb_viewer):
+    var PROJECT_CONN = "postgresql://neondb_viewer:__PASSWORD__@ep-lingering-snow-a8trajrb.eastus2.azure.neon.tech/neondb?sslmode=require";
+
+    var projectLayer = L.layerGroup();   // holds everything loaded from the DB
+    var projectLoaded = false;
+
+    function showProjPrompt() {
+      document.getElementById('proj-form').style.display = 'block';
+      document.getElementById('proj-toggle').style.display = 'none';
+      document.getElementById('proj-pw').focus();
+    }
+
+    function setProjMsg(text, isError) {
+      var el = document.getElementById('proj-msg');
+      el.textContent = text;
+      el.className = isError ? 'err' : '';
+    }
+
+    // The queries below convert PostGIS geom -> GeoJSON via ST_AsGeoJSON(geom)
+    // AS geojson. GeoJSON uses [lon,lat]; Leaflet wants [lat,lon].
+    function coordsToLatLng(coords) {
+      return coords.map(function (c) { return [c[1], c[0]]; });
+    }
+
+    function parsePoint(value) {
+      var g = value;
+      if (typeof g === 'string') { try { g = JSON.parse(g); } catch (e) { return null; } }
+      if (g && g.type === 'Point' && g.coordinates) return [g.coordinates[1], g.coordinates[0]];
+      return null;
+    }
+
+    function parseLineString(value) {
+      var g = value;
+      if (typeof g === 'string') { try { g = JSON.parse(g); } catch (e) { return null; } }
+      if (!g) return null;
+      if (g.type === 'LineString' && g.coordinates) return coordsToLatLng(g.coordinates);
+      if (g.type === 'MultiLineString' && g.coordinates) return g.coordinates.map(coordsToLatLng);
+      return null;
+    }
+
+    async function loadProjectLayers() {
+      if (projectLoaded) return;
+      var pw = document.getElementById('proj-pw').value;
+      if (!pw) { setProjMsg('enter the password', true); return; }
+      setProjMsg('connecting…', false);
+
+      try {
+        // Neon's HTTP driver — lets the browser run read queries over HTTPS.
+        var mod = await import('https://esm.sh/@neondatabase/serverless@1.1.0');
+        var sql = mod.neon(PROJECT_CONN.replace('__PASSWORD__', encodeURIComponent(pw)));
+
+        // two read-only queries; ST_AsGeoJSON turns PostGIS geom into GeoJSON text
+        var towersRes = await sql.query('SELECT id, name, type, designation, ST_AsGeoJSON(geom) AS geojson FROM sunrise_wtg_locations');
+        var cablesRes = await sql.query('SELECT *, ST_AsGeoJSON(geom) AS geojson FROM cable_status');
+
+        // driver returns either the rows array directly or { rows: [...] }
+        var towers = towersRes.rows || towersRes;
+        var cables = cablesRes.rows || cablesRes;
+
+        // Log one row of each so you can confirm/adjust column names in devtools.
+        if (towers[0]) console.log('sunrise_wtg_locations columns:', Object.keys(towers[0]));
+        if (cables[0]) console.log('cable_status columns:', Object.keys(cables[0]));
+
+        renderTowers(towers);
+        renderCables(cables);
+
+        // swap the public filing layer out for the project layers
+        if (map.hasLayer(publicWtgLayer)) map.removeLayer(publicWtgLayer);
+        projectLayer.addTo(map);
+        projectLoaded = true;
+        document.getElementById('proj-form').style.display = 'none';
+        setProjMsg('loaded ' + towers.length + ' towers, ' + cables.length + ' cables', false);
+      } catch (e) {
+        // Wrong password, blocked role, or a schema mismatch all land here.
+        console.log('project layer load failed:', e);
+        setProjMsg('could not load — check password / connection', true);
+      }
+    }
+
+    function renderTowers(rows) {
+      rows.forEach(function (r) {
+        var ll = parsePoint(r.geojson);
+        if (!ll) return;
+        var label = r.designation || r.name || '?';
+
+        // 150m ring, matching the public layer
+        L.circle(ll, { radius: 150, color: '#ffd54f', weight: 0.8, dashArray: '4 4', fillOpacity: 0.03, interactive: false }).addTo(projectLayer);
+
+        L.circleMarker(ll, {
+          radius: 4, color: '#ffd54f', weight: 1, fillColor: '#ffd54f', fillOpacity: 0.8
+        })
+          .bindPopup('<b>' + esc(String(label)) + '</b>'
+            + (r.name ? '<br>Name: ' + esc(String(r.name)) : '')
+            + (r.type ? '<br>Type: ' + esc(String(r.type)) : ''))
+          .bindTooltip(
+            '<b>' + esc(String(r.designation || '?')) + '</b>' + (r.name ? '<br>' + esc(String(r.name)) : ''),
+            { permanent: true, direction: 'bottom', offset: [0, 4], className: 'ves-label wtg-label' })
+          .addTo(projectLayer);
+      });
+    }
+
+    function renderCables(rows) {
+      rows.forEach(function (r) {
+        var line = parseLineString(r.geojson);
+        if (!line || line.length < 2) return;
+        var title = r.cable_route_ref || r.string_ref || ('cable ' + r.id);
+        var pop = '<b>' + esc(String(title)) + '</b>'
+          + (r.cable_type ? '<br>Type: ' + esc(String(r.cable_type)) : '')
+          + ((r.struc_1 || r.struc_2) ? '<br>Route: ' + esc(String(r.struc_1 || '?')) + ' \u2192 ' + esc(String(r.struc_2 || '?')) : '')
+          + (r.installed != null ? '<br>Installed: ' + esc(String(r.installed)) : '');
+        L.polyline(line, { color: '#c792ea', weight: 2, opacity: 0.9 })
+          .bindPopup(pop)
+          .addTo(projectLayer);
+      });
+    }
+
+    window.replay = function () {
+      import('./replay.js')
+        .then(function (mod) { return mod.start({ map: map, L: L, esc: esc, WATCHED: TARGETS }); })
+        .catch(function (e) { console.log('replay failed:', e); });
+    };
 
     // ===== TWO-CLICK STRETCH MEASURE (DBL-CLICK TRIGGER) =========================
     var ringCenter = null;
