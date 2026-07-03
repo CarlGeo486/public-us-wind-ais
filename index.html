@@ -206,7 +206,7 @@
     var DATA_URL   = USE_BUCKET ? BUCKET_URL : LOCAL_URL;
 
     var REFRESH_MS = 10000;                     // poll every 10 seconds
-    var TARGETS = [367194000, 368245692];       // highlighted MMSIs — keep in sync with WATCHED in server.js
+    var TARGETS = [367194000, 210739000];       // highlighted MMSIs — keep in sync with WATCHED in server.js
     var STALE_MS = 3600000;                     // strike through names older than 1 hour
 
     // AOI — keep in sync with BBOX in server.js. Leaflet bounds = [[S,W],[N,E]].
@@ -310,7 +310,8 @@
             var nm = vessel.name || String(vessel.mmsi);
             var strike = (Date.now() - vessel.t) > STALE_MS ? 'text-decoration:line-through;' : '';
             var labelColor = (isTarget || isFallback) ? 'color:' + clr + ';' : '';
-            var displayName = '<span style="' + strike + labelColor + '">' + esc(nm) + '</span>';
+            var labelSize  = isTarget ? 'font-size:14px;font-weight:bold;' : '';
+            var displayName = '<span style="' + strike + labelColor + labelSize + '">' + esc(nm) + '</span>';
 
             if (markers[vessel.mmsi]) {
               markers[vessel.mmsi].setLatLng([vessel.lat, vessel.lon])
@@ -466,8 +467,13 @@
     }
 
     window.replay = function () {
+      // Replay reads the history table with the same read-only neondb_viewer role,
+      // so it needs the same completed connection string the project layers build.
+      var pw = document.getElementById('proj-pw').value;
+      if (!pw) { alert('Enter the project password (top-right) first — replay reads the same read-only database.'); return; }
+      var conn = PROJECT_CONN.replace('__PASSWORD__', encodeURIComponent(pw));
       import('./replay.js')
-        .then(function (mod) { return mod.start({ map: map, L: L, esc: esc, WATCHED: TARGETS }); })
+        .then(function (mod) { return mod.start({ map: map, L: L, esc: esc, WATCHED: TARGETS, conn: conn }); })
         .catch(function (e) { console.log('replay failed:', e); });
     };
 
@@ -537,7 +543,8 @@
       var mm = mins.toString().padStart(2, '0');
 
       var labelHtml = '<span style="color:#8ab4f8; font-size:13px;">⏱ ' + hh + ':' + mm + ' at 10 kts</span><br>'
-        + '<b style="font-size:13px;">' + nm.toFixed(2) + ' NM</b>';
+        + '<b style="font-size:13px;">' + nm.toFixed(2) + ' NM</b>'
+        + '<br><span style="color:#9fdfc8; font-size:11px;">' + Math.round(meters) + ' m</span>';
 
       ringTooltip.setLatLng(e.latlng).setContent(labelHtml);
 
