@@ -167,6 +167,38 @@
     #proj-msg.err {
       color: #ff7a7a;
     }
+
+    .cable-legend {
+      background: rgba(8, 18, 22, .85);
+      color: #cfeee2;
+      padding: 8px 12px;
+      border: 1px solid #2c4a42;
+      border-radius: 6px;
+      font-size: 11px;
+      font-family: monospace;
+      line-height: 1.5;
+    }
+
+    .cable-legend .title {
+      color: #37e8a0;
+      font-weight: bold;
+      letter-spacing: 1px;
+      margin-bottom: 4px;
+      font-size: 10px;
+    }
+
+    .cable-legend .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 2px 0;
+    }
+
+    .cable-legend .sw {
+      display: inline-block;
+      width: 24px;
+      border-radius: 1px;
+    }
   </style>
 </head>
 
@@ -201,9 +233,9 @@
     //   false -> the local server (for dev, or an SSH tunnel to the VM)
     //   true  -> the public GCS bucket the VM publishes to (for GitHub Pages)
     var USE_BUCKET = true;
-    var LOCAL_URL  = "http://localhost:8080/vessels";
+    var LOCAL_URL = "http://localhost:8080/vessels";
     var BUCKET_URL = "https://storage.googleapis.com/wind-public-data-e37f6aaf3ba4/vessels.json";
-    var DATA_URL   = USE_BUCKET ? BUCKET_URL : LOCAL_URL;
+    var DATA_URL = USE_BUCKET ? BUCKET_URL : LOCAL_URL;
 
     var REFRESH_MS = 10000;                     // poll every 10 seconds
     var TARGETS = [367194000, 210739000];       // highlighted MMSIs — keep in sync with WATCHED in server.js
@@ -214,7 +246,7 @@
 
     // ===== MAP + STATIC LAYERS ===================================================
     var map = L.map('map');
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=cb1_2w8k_1_818df9fdbb6a38cd7437f870',
       { attribution: 'OpenStreetMap, CARTO', maxZoom: 19 }).addTo(map);
 
     // faint AOI outline, below the markers
@@ -246,6 +278,20 @@
         layer.bindTooltip(feature.properties.name, { permanent: true, direction: 'top', offset: [0, -3], className: 'ves-label wtg-label' });
       }
     }).addTo(publicWtgLayer);
+
+    // Legend for the project cable layer — only added to the map once cables render.
+    var cableLegend = L.control({ position: 'bottomleft' });
+    cableLegend.onAdd = function () {
+      var div = L.DomUtil.create('div', 'cable-legend');
+      div.innerHTML =
+        '<div class="title">CABLES</div>' +
+        '<div class="row"><span class="sw" style="background:#ff5252; height:3px"></span>800mm&sup2;</div>' +
+        '<div class="row"><span class="sw" style="background:#ffa726; height:3px"></span>300mm&sup2;</div>' +
+        '<div class="row"><span class="sw" style="background:#4ade80; height:2px"></span>150mm&sup2;</div>' +
+        '<div class="row" style="opacity:0.7"><span class="sw" style="background:#94a3b8; height:2px; opacity:0.5"></span>installed</div>';
+      L.DomEvent.disableClickPropagation(div);
+      return div;
+    };
 
     // ===== DISCLAIMER ============================================================
     function acknowledgeDisclaimer() {
@@ -310,7 +356,7 @@
             var nm = vessel.name || String(vessel.mmsi);
             var strike = (Date.now() - vessel.t) > STALE_MS ? 'text-decoration:line-through;' : '';
             var labelColor = (isTarget || isFallback) ? 'color:' + clr + ';' : '';
-            var labelSize  = isTarget ? 'font-size:14px;font-weight:bold;' : '';
+            var labelSize = isTarget ? 'font-size:14px;font-weight:bold;' : '';
             var displayName = '<span style="' + strike + labelColor + labelSize + '">' + esc(nm) + '</span>';
 
             if (markers[vessel.mmsi]) {
@@ -420,6 +466,7 @@
         if (map.hasLayer(publicWtgLayer)) map.removeLayer(publicWtgLayer);
         projectLayer.addTo(map);
         projectLoaded = true;
+        cableLegend.addTo(map);
         document.getElementById('proj-form').style.display = 'none';
         setProjMsg('loaded ' + towers.length + ' towers, ' + cables.length + ' cables', false);
       } catch (e) {
@@ -451,6 +498,21 @@
       });
     }
 
+    function cableStyle(r) {
+      // installed = done, recede into background
+      var done = r.installed === true || r.installed === 't' || r.installed === 'true' || r.installed === 1;
+      if (done) return { color: '#94a3b8', weight: 1.6, opacity: 0.45 };
+
+      // regex tolerates "600", "600mm²", "IAC-600", etc.
+      var t = String(r.cable_type || '');
+      if (/800/.test(t)) return { color: '#ff5252', weight: 3, opacity: 0.95 };
+      if (/300/.test(t)) return { color: '#ffa726', weight: 2.4, opacity: 0.95 };
+      if (/150/.test(t)) return { color: '#4ade80', weight: 1.8, opacity: 0.95 };
+
+      // unknown size — keep the old purple as a bug canary
+      return { color: '#c792ea', weight: 2, opacity: 0.9 };
+    }
+
     function renderCables(rows) {
       rows.forEach(function (r) {
         var line = parseLineString(r.geojson);
@@ -458,11 +520,9 @@
         var title = r.cable_route_ref || r.string_ref || ('cable ' + r.id);
         var pop = '<b>' + esc(String(title)) + '</b>'
           + (r.cable_type ? '<br>Type: ' + esc(String(r.cable_type)) : '')
-          + ((r.struc_1 || r.struc_2) ? '<br>Route: ' + esc(String(r.struc_1 || '?')) + ' \u2192 ' + esc(String(r.struc_2 || '?')) : '')
+          + (r.string_ref && r.string_ref !== title ? '<br>String ID: ' + esc(String(r.string_ref)) : '')
           + (r.installed != null ? '<br>Installed: ' + esc(String(r.installed)) : '');
-        L.polyline(line, { color: '#c792ea', weight: 2, opacity: 0.9 })
-          .bindPopup(pop)
-          .addTo(projectLayer);
+        L.polyline(line, cableStyle(r)).bindPopup(pop).addTo(projectLayer);
       });
     }
 
